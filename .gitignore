@@ -30,6 +30,10 @@ dist/
 # Configs
 configs/
 secrets/
+*.conf
+*.key
+*.pem
+*.crt
 
 # Logs
 *.log
@@ -47,3 +51,20 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+
+# CI/CD
+.gitlab-ci.yml
+.github/
+
+# Scripts and setup
+quick_fix.sh
+start_*.sh
+deploy-aws.sh
+deploy-windows.bat
+setup_aws.py
+
+# Misc
+*.bak
+*.tmp
+*.pid
+*.sock
