@@ -1,0 +1,20 @@
+stages:
+  - build
+  - deploy
+
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t tunnel-backend -f Dockerfile.backend .
+    - docker build -t tunnel-frontend -f Dockerfile.frontend .
+
+deploy:
+  stage: deploy
+  script:
+    - apt-get update && apt-get install -y ssh
+    - ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST "cd /home/ubuntu/tunnel-platform && git pull && docker-compose up -d --build"
+  only:
+    - main
