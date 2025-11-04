@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, status
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel, EmailStr, field_validator
@@ -12,6 +14,7 @@ import asyncio
 import qrcode
 from io import BytesIO
 import base64
+from pathlib import Path
 
 load_dotenv()
 
@@ -47,12 +50,13 @@ app = FastAPI(title="Tunnel Platform API", version="2.0.0")
 # CORS - Allow all for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Health check endpoints
 @app.get("/api/health")
 @app.get("/health")
 async def health_check():
@@ -99,9 +103,8 @@ class PeerCreate(BaseModel):
     name: str
     device_type: str = "phone"
 
-# Background task with proper session management
+# Background task
 async def launch_instance_task(instance_id: int):
-    """Background task with its own DB session"""
     db = SessionLocal()
     try:
         instance = db.query(Instance).filter(Instance.id == instance_id).first()
@@ -155,7 +158,6 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
 # ==================== INSTANCE ENDPOINTS ====================
 @app.get("/api/instances")
 async def list_instances(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """List all user instances - FIXED FORMAT"""
     try:
         instances = db.query(Instance).filter(Instance.user_id == current_user.id).order_by(Instance.created_at.desc()).all()
         
@@ -173,7 +175,7 @@ async def list_instances(current_user: User = Depends(get_current_user), db: Ses
                 "peer_count": peer_count
             })
         
-        return result  # Return list directly for frontend compatibility
+        return result
     except Exception as e:
         logger.error(f"List instances error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -186,12 +188,10 @@ async def create_instance(
     db: Session = Depends(get_db)
 ):
     try:
-        # Check instance limit
         count = db.query(Instance).filter(Instance.user_id == current_user.id).count()
         if count >= MAX_INSTANCES_PER_USER:
             raise HTTPException(status_code=400, detail=f"Maximum {MAX_INSTANCES_PER_USER} instances allowed")
 
-        # Create instance record
         instance = Instance(
             user_id=current_user.id,
             region=instance_data.region,
@@ -203,8 +203,6 @@ async def create_instance(
         db.refresh(instance)
 
         logger.info(f"Instance {instance.id} created for {current_user.email}")
-
-        # Launch in background
         background_tasks.add_task(launch_instance_task, instance.id)
 
         return {
@@ -234,20 +232,14 @@ async def delete_instance(
         if not instance:
             raise HTTPException(status_code=404, detail="Instance not found")
         
-        # Terminate AWS instance if exists
         if instance.aws_instance_id:
             try:
                 terminate_instance(instance.aws_instance_id)
             except Exception as e:
                 logger.error(f"AWS termination error: {str(e)}")
         
-        # Delete all peers
         db.query(Peer).filter(Peer.instance_id == instance_id).delete()
-        
-        # Delete allocation state
         db.query(AllocState).filter(AllocState.instance_id == instance_id).delete()
-        
-        # Delete instance
         db.delete(instance)
         db.commit()
         
@@ -267,7 +259,6 @@ async def list_peers(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List all peers for an instance"""
     try:
         instance = db.query(Instance).filter(
             Instance.id == instance_id,
@@ -289,7 +280,7 @@ async def list_peers(
                 "created_at": peer.created_at.isoformat() if peer.created_at else None
             })
         
-        return result  # Return list directly
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -304,7 +295,6 @@ async def create_peer(
     db: Session = Depends(get_db)
 ):
     try:
-        # Verify instance exists and belongs to user
         instance = db.query(Instance).filter(
             Instance.id == instance_id,
             Instance.user_id == current_user.id
@@ -316,7 +306,6 @@ async def create_peer(
         if instance.state != "running":
             raise HTTPException(status_code=400, detail="Instance not ready. Wait for it to be running.")
         
-        # Get or create allocation state
         alloc = db.query(AllocState).filter(AllocState.instance_id == instance.id).first()
         if not alloc:
             alloc = AllocState(instance_id=instance.id, last_octet=2)
@@ -324,14 +313,12 @@ async def create_peer(
             db.commit()
             db.refresh(alloc)
         
-        # Allocate IP
         next_octet = alloc.last_octet + 1
         if next_octet >= 254:
             raise HTTPException(status_code=400, detail="IP pool exhausted")
         
         peer_ip = f"{WG_SUBNET_PREFIX}.{next_octet}"
         
-        # Create peer
         peer = Peer(
             instance_id=instance.id,
             name=peer_data.name,
@@ -339,13 +326,10 @@ async def create_peer(
             assigned_ip=peer_ip
         )
         db.add(peer)
-        
-        # Update allocation
         alloc.last_octet = next_octet
         db.commit()
         db.refresh(peer)
         
-        # Generate config file
         os.makedirs(f"configs/{instance.id}", exist_ok=True)
         config = f"""[Interface]
 PrivateKey = <GENERATE_ON_CLIENT>
@@ -383,7 +367,6 @@ async def get_peer_config(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Download peer configuration file"""
     try:
         peer = db.query(Peer).join(Instance).filter(
             Peer.id == peer_id,
@@ -413,7 +396,6 @@ async def get_peer_qr(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Generate QR code for peer config"""
     try:
         peer = db.query(Peer).join(Instance).filter(
             Peer.id == peer_id,
@@ -430,7 +412,6 @@ async def get_peer_qr(
         with open(config_path, "r") as f:
             config = f.read()
         
-        # Generate QR code
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -463,7 +444,6 @@ async def delete_peer(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Delete a peer"""
     try:
         peer = db.query(Peer).join(Instance).filter(
             Peer.id == peer_id,
@@ -473,12 +453,10 @@ async def delete_peer(
         if not peer:
             raise HTTPException(status_code=404, detail="Peer not found")
         
-        # Delete config file
         config_path = f"configs/{peer.instance_id}/peer_{peer.id}.conf"
         if os.path.exists(config_path):
             os.remove(config_path)
         
-        # Delete peer
         db.delete(peer)
         db.commit()
         
@@ -491,6 +469,39 @@ async def delete_peer(
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==================== FRONTEND STATIC FILES ====================
+# Mount frontend AFTER all API routes
+frontend_path = Path(__file__).parent.parent / "frontend" / "dist"
+
+if frontend_path.exists():
+    # Serve static assets
+    app.mount("/assets", StaticFiles(directory=str(frontend_path / "assets")), name="assets")
+    
+    # Serve index.html for all other routes (SPA fallback)
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        """Serve frontend for all non-API routes"""
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        
+        file_path = frontend_path / full_path
+        if file_path.is_file():
+            return FileResponse(file_path)
+        
+        # SPA fallback - serve index.html
+        return FileResponse(frontend_path / "index.html")
+    
+    logger.info(f"✅ Frontend mounted from: {frontend_path}")
+else:
+    logger.warning(f"⚠️  Frontend not found at: {frontend_path}")
+    logger.warning("   Run 'cd frontend && npm run build' to build frontend")
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"🚀 Starting Tunnel Platform on port {port}")
+    logger.info(f"📍 API: http://localhost:{port}/api/health")
+    logger.info(f"📍 Docs: http://localhost:{port}/docs")
+    if frontend_path.exists():
+        logger.info(f"📍 Frontend: http://localhost:{port}/")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
